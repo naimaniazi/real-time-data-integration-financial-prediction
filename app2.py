@@ -1,8 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import aiohttp
-import asyncio
+import requests
 from river import linear_model, preprocessing
 import plotly.graph_objects as go
 import plotly.express as px
@@ -35,7 +34,6 @@ logging.basicConfig(filename="app_log.txt", level=logging.INFO, format="%(asctim
 
 # ---------------------- FETCH HISTORICAL DATA ----------------------
 def fetch_historical_data():
-    import requests
     try:
         url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1min&outputsize=500&apikey={API_KEY}"
         response = requests.get(url, timeout=10).json()
@@ -50,7 +48,6 @@ def fetch_historical_data():
         raise ValueError("API failed")
     except:
         dates = pd.date_range(end=datetime.now(pk_tz), periods=500, freq='T', tz=pk_tz)
-        # Smaller random variation for realistic forex
         base_rate = 279.8
         rates = [base_rate + random.uniform(-0.3, 0.3) for _ in range(500)]
         df = pd.DataFrame({"datetime": dates, "exchange_rate": rates})
@@ -118,28 +115,22 @@ update_count = 0
 success_count = 0
 failure_count = 0
 
-# FIX 1: Initialize predictions with actual values instead of empty list
-initial_len = len(df)
 actual_timestamps = list(df["datetime"])
 actuals = list(df["exchange_rate"])
-predictions = list(df["exchange_rate"])  # Start with actual values, not empty!
-pred_timestamps = list(df["datetime"])   # Match timestamps
-
-# Keep only last N points for display performance
+predictions = list(df["exchange_rate"])
+pred_timestamps = list(df["datetime"])
 display_window = 100
 
 # ---------------------- HELPER FUNCTIONS ----------------------
-async def fetch_live_rate():
-    url = f"https://api.twelvedata.com/time_series?symbol= {symbol}&interval=1min&outputsize=1&apikey={API_KEY}"
+def fetch_live_rate():
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=8) as resp:
-                js = await resp.json()
-                if "values" in js:
-                    return float(js["values"][0]["close"]), "API (Live)"
-                raise ValueError
+        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1min&outputsize=1&apikey={API_KEY}"
+        resp = requests.get(url, timeout=10)
+        js = resp.json()
+        if "values" in js:
+            return float(js["values"][0]["close"]), "API (Live)"
+        raise ValueError
     except:
-        # Realistic micro-movement (smaller noise)
         last_rate = float(df["exchange_rate"].iloc[-1])
         noise = random.uniform(-0.05, 0.05)
         return last_rate + noise, "Simulated Data"
@@ -158,150 +149,120 @@ def retrain_model_on_drift():
     st.warning("⚠️ Model drift detected — retraining completed.")
 
 # ---------------------- MAIN LOOP ----------------------
-async def run_stream():
-    global update_count, success_count, failure_count, df, model, actual_timestamps, pred_timestamps, actuals, predictions
+while not st.session_state.stop_stream:
+    start = time.time()
+    latest_rate, data_source = fetch_live_rate()
 
-    while True:
-        if st.session_state.stop_stream:
-            st.success("✅ Live streaming stopped.")
-            break
+    prev_rate = df["exchange_rate"].iloc[-1]
+    x_live = {
+        "prev_rate": prev_rate,
+        "rate_change": latest_rate - prev_rate,
+        "hour": datetime.now(pk_tz).hour
+    }
+    
+    pred = model.predict_one(x_live)
+    
+    prediction_error = abs(pred - latest_rate)
+    if prediction_error > 0.05:
+        pred = 0.2 * pred + 0.8 * latest_rate
+    
+    max_deviation = 0.5
+    if abs(pred - latest_rate) > max_deviation:
+        pred = latest_rate + (max_deviation if pred > latest_rate else -max_deviation)
+    
+    actual = latest_rate
+    model.learn_one(x_live, actual)
 
-        start = time.time()
-        latest_rate, data_source = await fetch_live_rate()
+    if update_count % 20 == 0:
+        joblib.dump(model, model_file)
 
-        prev_rate = df["exchange_rate"].iloc[-1]
-        x_live = {
-            "prev_rate": prev_rate,
-            "rate_change": latest_rate - prev_rate,
-            "hour": datetime.now(pk_tz).hour
-        }
-        
-        pred = model.predict_one(x_live)
-        
-        # ==================== FAST CORRECTION ====================
-        # Jab gap zyada ho toh fast correction
-        prediction_error = abs(pred - latest_rate)
-        if prediction_error > 0.05: 
-           
-            pred = 0.2 * pred + 0.8 * latest_rate  
-        # ==========================================================
-        
-        # FIX 2: Clamp prediction to realistic range (prevent wild spikes) - Safety net
-        max_deviation = 0.5  # Max 0.5 PKR deviation
-        if abs(pred - latest_rate) > max_deviation:
-            pred = latest_rate + (max_deviation if pred > latest_rate else -max_deviation)
-        
-        actual = latest_rate
-        model.learn_one(x_live, actual)
+    now_pk = datetime.now(pk_tz)
+    new_row = pd.DataFrame({"datetime": [now_pk], "exchange_rate": [actual]})
+    df = pd.concat([df, new_row], ignore_index=True)
+    df.to_csv(csv_file, index=False)
+    clean_csv_if_needed()
 
-        if update_count % 20 == 0:
-            joblib.dump(model, model_file)
+    success_threshold = 0.15
+    if abs(pred - actual) <= success_threshold:
+        success_count += 1
+        status = "✅ Success"
+        color = "green"
+    else:
+        failure_count += 1
+        status = "⚠️ Deviation"
+        color = "orange"
 
-        now_pk = datetime.now(pk_tz)
-        new_row = pd.DataFrame({"datetime": [now_pk], "exchange_rate": [actual]})
-        df = pd.concat([df, new_row], ignore_index=True)
-        df.to_csv(csv_file, index=False)
-        clean_csv_if_needed()
+    update_count += 1
+    error = round(abs(actual - pred), 4)
+    total = success_count + failure_count
+    accuracy = round((success_count / total) * 100, 2) if total > 0 else 0
 
-        # SUCCESS / FAILURE (reasonable threshold for forex)
-        success_threshold = 0.15  # 15 pips threshold
-        if abs(pred - actual) <= success_threshold:
-            success_count += 1
-            status = "✅ Success"
-            color = "green"
-        else:
-            failure_count += 1
-            status = "⚠️ Deviation"
-            color = "orange"
+    logging.info(f"{status} | Error {error} | Source {data_source}")
 
-        update_count += 1
-        error = round(abs(actual - pred), 4)
-        total = success_count + failure_count
-        accuracy = round((success_count / total) * 100, 2) if total > 0 else 0
+    if failure_count != 0 and failure_count % 15 == 0:
+        retrain_model_on_drift()
 
-        logging.info(f"{status} | Error {error} | Source {data_source}")
+    # ---------------- METRICS ----------------
+    with metrics_placeholder.container():
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Actual USD/PKR", f"{actual:.3f}")
+        col2.metric("Predicted USD/PKR", f"{pred:.3f}")
+        col3.metric("Error", f"{error:.4f}")
+        col4.markdown(f"<span style='color:{color};font-weight:bold'>{status}</span>", unsafe_allow_html=True)
 
-        if failure_count != 0 and failure_count % 15 == 0:
-            retrain_model_on_drift()
+    with accuracy_placeholder.container():
+        st.progress(min(int(accuracy), 100))
+        st.caption(f"Accuracy: {accuracy}% | Updates: {update_count} | Success: {success_count} | Source: {data_source}")
 
-        # ---------------- METRICS ----------------
-        with metrics_placeholder.container():
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Actual USD/PKR", f"{actual:.3f}")
-            col2.metric("Predicted USD/PKR", f"{pred:.3f}")
-            col3.metric("Error", f"{error:.4f}")
-            col4.markdown(f"<span style='color:{color};font-weight:bold'>{status}</span>", unsafe_allow_html=True)
+    # ---------------- LIVE GRAPH ----------------
+    actual_timestamps.append(now_pk)
+    actuals.append(actual)
+    pred_timestamps.append(now_pk)
+    predictions.append(pred)
 
-        with accuracy_placeholder.container():
-            st.progress(min(int(accuracy), 100))
-            st.caption(f"Accuracy: {accuracy}% | Updates: {update_count} | Success: {success_count} | Source: {data_source}")
+    if len(actuals) > display_window:
+        actual_timestamps = actual_timestamps[-display_window:]
+        actuals = actuals[-display_window:]
+        pred_timestamps = pred_timestamps[-display_window:]
+        predictions = predictions[-display_window:]
 
-        # ---------------- LIVE GRAPH ----------------
-        actual_timestamps.append(now_pk)
-        actuals.append(actual)
-        pred_timestamps.append(now_pk)
-        predictions.append(pred)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=actual_timestamps,
+        y=actuals,
+        mode='lines',
+        name='Actual',
+        line=dict(color='#00CC96', width=2),
+        hovertemplate='Actual: %{y:.3f}<extra></extra>'
+    ))
+    fig.add_trace(go.Scatter(
+        x=pred_timestamps,
+        y=predictions,
+        mode='lines',
+        name='Predicted',
+        line=dict(color='#EF553B', width=2, dash='dash'),
+        hovertemplate='Predicted: %{y:.3f}<extra></extra>'
+    ))
+    y_min = min(min(actuals), min(predictions)) - 0.1
+    y_max = max(max(actuals), max(predictions)) + 0.1
+    fig.update_layout(
+        title="💹 USD/PKR Real-Time Stream (Predicted vs Actual)",
+        xaxis_title="Time (PKT)",
+        yaxis_title="Exchange Rate (PKR)",
+        template="plotly_dark",
+        legend=dict(x=0, y=1, bgcolor="rgba(0,0,0,0.5)"),
+        hovermode="x unified",
+        margin=dict(l=40, r=40, t=60, b=40),
+        font=dict(size=12),
+        yaxis=dict(range=[y_min, y_max], tickformat=".3f", title_font={"size": 12}),
+        xaxis=dict(tickformat="%H:%M:%S", title_font={"size": 12}),
+        showlegend=True,
+        height=500
+    )
+    chart_placeholder.plotly_chart(fig, use_container_width=True)
 
-        # FIX 3: Rolling window - keep only last N points for smooth chart
-        if len(actuals) > display_window:
-            actual_timestamps = actual_timestamps[-display_window:]
-            actuals = actuals[-display_window:]
-            pred_timestamps = pred_timestamps[-display_window:]
-            predictions = predictions[-display_window:]
-
-        fig = go.Figure()
-
-        # Actual line (solid)
-        fig.add_trace(go.Scatter(
-            x=actual_timestamps,
-            y=actuals,
-            mode='lines',
-            name='Actual',
-            line=dict(color='#00CC96', width=2),
-            hovertemplate='Actual: %{y:.3f}<extra></extra>'
-        ))
-
-        # Predicted line (dashed)
-        fig.add_trace(go.Scatter(
-            x=pred_timestamps,
-            y=predictions,
-            mode='lines',
-            name='Predicted',
-            line=dict(color='#EF553B', width=2, dash='dash'),
-            hovertemplate='Predicted: %{y:.3f}<extra></extra>'
-        ))
-
-        # FIX 4: Fixed y-axis range calculation for stable view
-        y_min = min(min(actuals), min(predictions)) - 0.1
-        y_max = max(max(actuals), max(predictions)) + 0.1
-
-        fig.update_layout(
-            title="💹 USD/PKR Real-Time Stream (Predicted vs Actual)",
-            xaxis_title="Time (PKT)",
-            yaxis_title="Exchange Rate (PKR)",
-            template="plotly_dark",
-            legend=dict(x=0, y=1, bgcolor="rgba(0,0,0,0.5)"),
-            hovermode="x unified",
-            margin=dict(l=40, r=40, t=60, b=40),
-            font=dict(size=12),
-            yaxis=dict(
-                range=[y_min, y_max],  # Fixed range prevents jumping
-                tickformat=".3f",
-                title_font={"size": 12}
-            ),
-            xaxis=dict(
-                tickformat="%H:%M:%S",
-                title_font={"size": 12}
-            ),
-            showlegend=True,
-            height=500
-        )
-
-        chart_placeholder.plotly_chart(fig, use_container_width=True)
-
-        elapsed = time.time() - start
-        adaptive_delay = max(2, delay - elapsed)
-        await asyncio.sleep(adaptive_delay)
+    elapsed = time.time() - start
+    time.sleep(max(2, delay - elapsed))
 
 # ---------------------- HISTORICAL TAB ----------------------
 with tab2:
@@ -313,6 +274,3 @@ with tab2:
     fig_hist.update_layout(yaxis_tickformat=".3f")
     st.plotly_chart(fig_hist, use_container_width=True)
     st.caption(f"Data Source: {'Simulated' if using_simulated else 'Live API'} | Records: {len(df)}")
-
-# ---------------------- RUN STREAM ----------------------
-asyncio.run(run_stream())
