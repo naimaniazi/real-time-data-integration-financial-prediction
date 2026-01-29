@@ -22,7 +22,7 @@ st.set_page_config(
 
 st.markdown("<h1 style='text-align:center'>💹 USD/PKR AI-Powered Real-Time Prediction Dashboard</h1>", unsafe_allow_html=True)
 
-API_KEY = os.getenv("TWELVEDATA_API_KEY")
+API_KEY = "7731bb3aac804f35aaff75a6b22b4f79"
 symbol = "USD/PKR"
 csv_file = "usd_pkr_data.csv"
 model_file = "usd_pkr_model.pkl"
